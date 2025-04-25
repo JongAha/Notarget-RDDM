@@ -15,6 +15,79 @@ def convert_image_to_fn(img_type, image):
         return image.convert(img_type)
     return image
 
+# class Dataset(Dataset):
+#     def __init__(
+#         self,
+#         folder,
+#         image_size,
+#         exts=['jpg', 'jpeg', 'png', 'tiff'],
+#         augment_flip = False,
+#         convert_image_to = None,
+#         condition = 0,
+#         equalizeHist = False,
+#         crop_patch = False,
+#         sample = False,
+#         generation = False
+#     ):
+#         super().__init__()
+#         self.folder = folder
+#         self.image_size = image_size
+#         self.exts = exts
+#         self.augment_flip = augment_flip
+#         self.convert_image_to = convert_image_to
+#         self.condition = condition
+#         self.equalizeHist = equalizeHist
+#         self.crop_patch = crop_patch
+#         self.sample = sample
+#         self.generation = generation
+        
+#         # 获取图像文件
+#         self.paths = sorted([p for p in Path(f'{folder}').glob('**/*.PNG')])
+        
+#         # 如果是生成模式，加载标签
+#         if self.generation:
+#             label_file = os.path.join(os.path.dirname(folder), 'labels.txt')
+#             with open(label_file, 'r') as f:
+#                 self.labels = [int(line.strip()) for line in f.readlines()]
+            
+#             # 确保图像和标签数量匹配
+#             assert len(self.paths) >= len(self.labels), \
+#                 f"Number of images ({len(self.paths)}) must be >= number of labels ({len(self.labels)})"
+#             self.paths = self.paths[:len(self.labels)]
+
+#     def __len__(self):
+#         return len(self.paths)
+
+#     def __getitem__(self, index):
+#         path = self.paths[index]
+#         img = Image.open(path)
+
+#         if self.convert_image_to is not None:
+#             img = img.convert(self.convert_image_to)
+
+#         if self.equalizeHist:
+#             img = ImageOps.equalize(img)
+
+#         if self.crop_patch:
+#             img, pad_size = self.random_crop_with_pad(img)
+#             self.pad_size_list.append(pad_size)
+
+#         if self.augment_flip and random() < 0.5:
+#             img = img.transpose(PIL.Image.FLIP_LEFT_RIGHT)
+
+#         if self.condition:
+#             img = img.resize((self.image_size, self.image_size))
+#             img = resize_with_pad(img, self.image_size, self.image_size)
+#         else:
+#             img = img.resize((self.image_size, self.image_size))
+
+#         img = T.ToTensor()(img)
+        
+#         # 如果是生成模式，返回图像和标签
+#         if self.generation:
+#             return img, self.labels[index]
+#         return img
+
 class Dataset(Dataset):
     def __init__(
         self,

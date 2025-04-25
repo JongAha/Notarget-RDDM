@@ -1,137 +1,71 @@
 import os
 import sys
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from src.residual_denoising_diffusion_pytorch import UnetRes, set_seed, Trainer
+from src.adversarial_rddm import AdversarialRDDM
 
-from src.denoising_diffusion_pytorch import GaussianDiffusion
-from src.residual_denoising_diffusion_pytorch import (ResidualDiffusion,
-                                                      Trainer, Unet, UnetRes,
-                                                      set_seed)
-
-# init
-os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(e) for e in [0])
-sys.stdout.flush()
+# 初始化设置
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 set_seed(10)
-debug = False
 
-if debug:
-    save_and_sample_every = 2
-    sampling_timesteps = 10
-    sampling_timesteps_original_ddim_ddpm = 10
-    train_num_steps = 200
-else:
-    save_and_sample_every = 1000
-    if len(sys.argv) > 1:
-        sampling_timesteps = int(sys.argv[1])
-    else:
-        sampling_timesteps = 10
-    sampling_timesteps_original_ddim_ddpm = 250
-    train_num_steps = 100000
+# 配置参数
+image_size = 256  # ImageNet图像尺寸
+sampling_timesteps = 100  # 采样时间步
+train_batch_size = 2
+num_samples = 1
 
-original_ddim_ddpm = False
-if original_ddim_ddpm:
-    condition = False
-    input_condition = False
-    input_condition_mask = False
-else:
-    condition = False
-    input_condition = False
-    input_condition_mask = False
+# 创建保存目录
+os.makedirs('results', exist_ok=True)
 
-if condition:
-    # Image restoration  
-    if input_condition:
-        folder = ["xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_free_train.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_train.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_mask_train.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_free_test.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_test.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_mask_test.flist"]
-    else:
-        folder = ["xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_free_train.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_train.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_free_test.flist",
-                  "xxx/dataset/ISTD_Dataset_arg/data_val/ISTD_shadow_test.flist"]
-    train_batch_size = 1
-    num_samples = 1
-    sum_scale = 0.01
-    image_size = 256
-else:
-    # Image Generation 
-    folder = 'xxx/CelebA/img_align_celeba'
-    train_batch_size = 128
-    num_samples = 64
-    sum_scale = 1
-    image_size = 64
-
-num_unet = 2
-objective = 'pred_retis_noise'
-test_res_or_noise = "res_noise"
-if original_ddim_ddpm:
-    model = Unet(
-        dim=64,
-        dim_mults=(1, 2, 4, 8)
-    )
-    diffusion = GaussianDiffusion(
-        model,
-        image_size=image_size,
-        timesteps=1000,           # number of steps
-        sampling_timesteps=sampling_timesteps_original_ddim_ddpm,
-        loss_type='l1',            # L1 or L2
-    )
-else:
-    model = UnetRes(
-        dim=64,
-        dim_mults=(1, 2, 4, 8),
-        num_unet=num_unet,
-        condition=condition,
-        input_condition=input_condition,
-        objective=objective,
-        test_res_or_noise = test_res_or_noise
-    )
-    diffusion = ResidualDiffusion(
-        model,
-        image_size=image_size,
-        timesteps=1000,           # number of steps
-        # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
-        sampling_timesteps=sampling_timesteps,
-        objective=objective,
-        loss_type='l2',            # L1 or L2
-        condition=condition,
-        sum_scale=sum_scale,
-        input_condition=input_condition,
-        input_condition_mask=input_condition_mask,
-        test_res_or_noise = test_res_or_noise
-    )
-
-trainer = Trainer(
-    diffusion,
-    folder,
-    train_batch_size=train_batch_size,
-    num_samples=num_samples,
-    train_lr=2e-4,
-    train_num_steps=train_num_steps,         # total training steps
-    gradient_accumulate_every=2,    # gradient accumulation steps
-    ema_decay=0.995,                # exponential moving average decay
-    amp=False,                        # turn on mixed precision
-    convert_image_to="RGB",
-    condition=condition,
-    save_and_sample_every=save_and_sample_every,
-    equalizeHist=False,
-    crop_patch=False,
-    generation=True,
-    num_unet=num_unet,
+# 模型配置
+model = UnetRes(
+    dim=64,
+    dim_mults=(1, 2, 4, 8),
+    num_unet=2,
+    condition=False,
+    objective='pred_res_noise',
+    test_res_or_noise="res_noise"
 )
 
-# train
-trainer.train()
+# 初始化对抗RDDM模型
+diffusion = AdversarialRDDM(
+    model,
+    image_size=image_size,
+    timesteps=1000,
+    sampling_timesteps=sampling_timesteps,
+    objective='pred_res_noise',
+    loss_type='l2',
+    condition=False,
+    target_model_name='resnet18',
+    adv_lambda=0.1  # 对抗损失权重
+).cuda()
 
-# test
-if not trainer.accelerator.is_local_main_process:
-    pass
-else:
-    trainer.load(trainer.train_num_steps//save_and_sample_every)
-    trainer.set_results_folder(
-        './results/test_timestep_'+str(sampling_timesteps))
-    trainer.test(last=True)
+# 训练器配置
+trainer = Trainer(
+    diffusion_model=diffusion,
+    folder='./data/imagenet-compatible/images',
+    train_batch_size=train_batch_size,
+    train_lr=2e-4,
+    train_num_steps=1000,
+    gradient_accumulate_every=2,
+    ema_decay=0.995,
+    amp=False,
+    num_samples=num_samples,
+    save_and_sample_every=100,
+    results_folder='results',
+    convert_image_to='RGB',
+    condition=False,
+    generation=True,
+    num_unet=2
+)
 
-# trainer.set_results_folder('./results/test_sample')
-# trainer.test(sample=True)
+if __name__ == "__main__":
+    # 开始训练
+    print("Starting training...")
+    trainer.train()
+    
+    # 训练后保存模型
+    trainer.save(trainer.step)
+    print(f"Training completed. Model saved at step {trainer.step}")

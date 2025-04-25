@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from accelerate import Accelerator
-from datasets.get_dataset import dataset
+# from datasets.get_dataset import dataset
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
@@ -26,10 +26,89 @@ from torch.utils.data import DataLoader
 from torchvision import transforms as T
 from torchvision import utils
 from tqdm.auto import tqdm
+from torch.utils.data import Dataset
+from random import random as rand
+from PIL import Image, ImageOps
+import PIL
 
 ModelResPrediction = namedtuple(
     'ModelResPrediction', ['pred_res', 'pred_noise', 'pred_x_start'])
+
+
 # helpers functions
+
+
+class dataset(Dataset):
+    def __init__(
+            self,
+            folder,
+            image_size,
+            augment_flip=False,
+            convert_image_to=None,
+            condition=0,
+            equalizeHist=False,
+            crop_patch=False,
+            sample=False,
+            generation=False
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.augment_flip = augment_flip
+        self.convert_image_to = convert_image_to
+        self.condition = condition
+        self.equalizeHist = equalizeHist
+        self.crop_patch = crop_patch
+        self.sample = sample
+        self.generation = generation
+
+        # 获取图像文件
+        self.paths = sorted([p for p in Path(f'{folder}').glob('**/*.PNG')])
+        print(f"Found {len(self.paths)} images in {folder}")
+
+        # 如果是生成模式，加载标签
+        if self.generation:
+            label_file = os.path.join(os.path.dirname(folder), 'labels.txt')
+            with open(label_file, 'r') as f:
+                self.labels = [int(line.strip()) for line in f.readlines()]
+
+            # 确保图像和标签数量匹配
+            assert len(self.paths) >= len(self.labels), \
+                f"Number of images ({len(self.paths)}) must be >= number of labels ({len(self.labels)})"
+            self.paths = self.paths[:len(self.labels)]
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+
+        if self.convert_image_to is not None:
+            img = img.convert(self.convert_image_to)
+
+        if self.equalizeHist:
+            img = ImageOps.equalize(img)
+
+        if self.crop_patch:
+            img, pad_size = self.random_crop_with_pad(img)
+            self.pad_size_list.append(pad_size)
+
+        if self.augment_flip and rand() < 0.5:
+            img = img.transpose(PIL.Image.FLIP_LEFT_RIGHT)
+
+        if self.condition:
+            img = img.resize((self.image_size, self.image_size))
+            img = resize_with_pad(img, self.image_size, self.image_size)
+        else:
+            img = img.resize((self.image_size, self.image_size))
+
+        img = T.ToTensor()(img)
+
+        # 如果是生成模式，返回图像和标签
+        if self.generation:
+            return img, self.labels[index]
+        return img
 
 
 def set_seed(SEED):
@@ -88,6 +167,7 @@ def unnormalize_to_zero_to_one(img):
         return [(img[k] + 1) * 0.5 for k in range(len(img))]
     else:
         return (img + 1) * 0.5
+
 
 # small helper modules
 
@@ -152,6 +232,7 @@ class PreNorm(nn.Module):
         x = self.norm(x)
         return self.fn(x)
 
+
 # sinusoidal positional embeds
 
 
@@ -187,6 +268,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim=-1)
         return fouriered
+
 
 # building block modules
 
@@ -224,7 +306,6 @@ class ResnetBlock(nn.Module):
             dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
-
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
@@ -299,20 +380,20 @@ class Attention(nn.Module):
 
 class Unet(nn.Module):
     def __init__(
-        self,
-        dim,
-        init_dim=None,
-        out_dim=None,
-        dim_mults=(1, 2, 4, 8),
-        channels=3,
-        self_condition=False,
-        resnet_block_groups=8,
-        learned_variance=False,
-        learned_sinusoidal_cond=False,
-        random_fourier_features=False,
-        learned_sinusoidal_dim=16,
-        condition=False,
-        input_condition=False
+            self,
+            dim,
+            init_dim=None,
+            out_dim=None,
+            dim_mults=(1, 2, 4, 8),
+            channels=3,
+            self_condition=False,
+            resnet_block_groups=8,
+            learned_variance=False,
+            learned_sinusoidal_cond=False,
+            random_fourier_features=False,
+            learned_sinusoidal_dim=16,
+            condition=False,
+            input_condition=False
     ):
         super().__init__()
 
@@ -321,8 +402,8 @@ class Unet(nn.Module):
         self.channels = channels
         self.self_condition = self_condition
         input_channels = channels + channels * \
-            (1 if self_condition else 0) + channels * \
-            (1 if condition else 0) + channels * (1 if input_condition else 0)
+                         (1 if self_condition else 0) + channels * \
+                         (1 if condition else 0) + channels * (1 if input_condition else 0)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
@@ -436,23 +517,23 @@ class Unet(nn.Module):
 
 class UnetRes(nn.Module):
     def __init__(
-        self,
-        dim,
-        init_dim=None,
-        out_dim=None,
-        dim_mults=(1, 2, 4, 8),
-        channels=3,
-        self_condition=False,
-        resnet_block_groups=8,
-        learned_variance=False,
-        learned_sinusoidal_cond=False,
-        random_fourier_features=False,
-        learned_sinusoidal_dim=16,
-        num_unet=1,
-        condition=False,
-        input_condition=False,
-        objective='pred_res_noise',
-        test_res_or_noise="res_noise"
+            self,
+            dim,
+            init_dim=None,
+            out_dim=None,
+            dim_mults=(1, 2, 4, 8),
+            channels=3,
+            self_condition=False,
+            resnet_block_groups=8,
+            learned_variance=False,
+            learned_sinusoidal_cond=False,
+            random_fourier_features=False,
+            learned_sinusoidal_dim=16,
+            num_unet=1,
+            condition=False,
+            input_condition=False,
+            objective='pred_res_noise',
+            test_res_or_noise="res_noise"
     ):
         super().__init__()
         self.condition = condition
@@ -509,25 +590,43 @@ class UnetRes(nn.Module):
                               input_condition=input_condition)
 
     def forward(self, x, time, x_self_cond=None):
+        """
+        修改后的前向传播方法
+        Args:
+            x: 输入张量
+            time: 时间步
+            x_self_cond: 自条件输入（可选）
+        Returns:
+            根据模型配置返回适当的输出
+        """
+        if isinstance(time, (list, tuple)):
+            time_res, time_noise = time[0], time[1]
+        else:
+            time_res = time_noise = time
+
         if self.num_unet == 2:
             if self.test_res_or_noise == "res_noise":
-                return self.unet0(x, time[0], x_self_cond=x_self_cond), self.unet1(x, time[1], x_self_cond=x_self_cond)
+                return self.unet0(x, time_res, x_self_cond=x_self_cond), self.unet1(x, time_noise,
+                                                                                    x_self_cond=x_self_cond)
             elif self.test_res_or_noise == "res":
-                return self.unet0(x, time[0], x_self_cond=x_self_cond), 0
+                return self.unet0(x, time_res, x_self_cond=x_self_cond), torch.zeros_like(x)
             elif self.test_res_or_noise == "noise":
-                return 0, self.unet1(x, time[1], x_self_cond=x_self_cond)
+                return torch.zeros_like(x), self.unet1(x, time_noise, x_self_cond=x_self_cond)
         elif self.num_unet == 1:
             if self.objective == 'pred_res_noise':
-                # num_unet=2
-                pass
-            elif self.objective == 'pred_x0_noise':
-                # num_unet=2
-                pass
-            elif self.objective == "pred_noise":
-                time = time[1]
+                # 对于单个unet处理残差和噪声的情况
+                output = self.unet0(x, time_res, x_self_cond=x_self_cond)
+                if isinstance(output, (list, tuple)):
+                    return output
+                # 如果输出是单个张量，则根据objective决定如何处理
+                return output, torch.zeros_like(output)
+            elif self.objective in ["pred_noise", "pred_x0_noise"]:
+                return self.unet0(x, time_noise, x_self_cond=x_self_cond)
             elif self.objective == "pred_res":
-                time = time[0]
-            return [self.unet0(x, time, x_self_cond=x_self_cond)]
+                return self.unet0(x, time_res, x_self_cond=x_self_cond)
+            else:
+                return self.unet0(x, time_res, x_self_cond=x_self_cond)
+
 
 # gaussian diffusion trainer class
 
@@ -541,31 +640,32 @@ def extract(a, t, x_shape):
 def gen_coefficients(timesteps, schedule="increased", sum_scale=1, ratio=1):
     if schedule == "increased":
         x = np.linspace(0, 1, timesteps, dtype=np.float32)
-        y = x**ratio
+        y = x ** ratio
         y = torch.from_numpy(y)
         y_sum = y.sum()
-        alphas = y/y_sum
+        alphas = y / y_sum
     elif schedule == "decreased":
         x = np.linspace(0, 1, timesteps, dtype=np.float32)
-        y = x**ratio
+        y = x ** ratio
         y = torch.from_numpy(y)
         y_sum = y.sum()
         y = torch.flip(y, dims=[0])
-        alphas = y/y_sum
+        alphas = y / y_sum
     elif schedule == "average":
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
+        alphas = torch.full([timesteps], 1 / timesteps, dtype=torch.float32)
     elif schedule == "normal":
         sigma = 1.0
         mu = 0.0
-        x = np.linspace(-3+mu, 3+mu, timesteps, dtype=np.float32)
-        y = np.e**(-((x-mu)**2)/(2*(sigma**2)))/(np.sqrt(2*np.pi)*(sigma**2))
+        x = np.linspace(-3 + mu, 3 + mu, timesteps, dtype=np.float32)
+        y = np.e ** (-((x - mu) ** 2) / (2 * (sigma ** 2))) / (np.sqrt(2 * np.pi) * (sigma ** 2))
         y = torch.from_numpy(y)
-        alphas = y/y.sum()
+        alphas = y / y.sum()
     else:
-        alphas = torch.full([timesteps], 1/timesteps, dtype=torch.float32)
-    assert (alphas.sum()-1).abs() < 1e-6
+        alphas = torch.full([timesteps], 1 / timesteps, dtype=torch.float32)
+    assert (alphas.sum() - 1).abs() < 1e-6
 
-    return alphas*sum_scale
+    return alphas * sum_scale
+
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
 
@@ -601,24 +701,24 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor
 
 class ResidualDiffusion(nn.Module):
     def __init__(
-        self,
-        model,
-        *,
-        image_size,
-        timesteps=1000,
-        sampling_timesteps=None,
-        loss_type='l1',
-        objective='pred_res_noise',
-        ddim_sampling_eta=0.,
-        condition=False,
-        sum_scale=None,
-        input_condition=False,
-        input_condition_mask=False,
-        test_res_or_noise="None"
+            self,
+            model,
+            *,
+            image_size,
+            timesteps=1000,
+            sampling_timesteps=None,
+            loss_type='l1',
+            objective='pred_res_noise',
+            ddim_sampling_eta=0.,
+            condition=False,
+            sum_scale=None,
+            input_condition=False,
+            input_condition_mask=False,
+            test_res_or_noise="None"
     ):
         super().__init__()
         assert not (
-            type(self) == ResidualDiffusion and model.channels != model.out_dim)
+                type(self) == ResidualDiffusion and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
@@ -637,7 +737,7 @@ class ResidualDiffusion(nn.Module):
         else:
             self.sum_scale = sum_scale if sum_scale else 1.
 
-        convert_to_ddim=True
+        convert_to_ddim = True
         if convert_to_ddim:
             beta_schedule = "linear"
             beta_start = 0.0001
@@ -648,8 +748,8 @@ class ResidualDiffusion(nn.Module):
             elif beta_schedule == "scaled_linear":
                 # this schedule is very specific to the latent diffusion model.
                 betas = (
-                    torch.linspace(beta_start**0.5, beta_end**0.5,
-                                   timesteps, dtype=torch.float32) ** 2
+                        torch.linspace(beta_start ** 0.5, beta_end ** 0.5,
+                                       timesteps, dtype=torch.float32) ** 2
                 )
             elif beta_schedule == "squaredcos_cap_v2":
                 # Glide cosine schedule
@@ -660,14 +760,14 @@ class ResidualDiffusion(nn.Module):
 
             alphas = 1.0 - betas
             alphas_cumprod = torch.cumprod(alphas, dim=0)
-            alphas_cumsum = 1-alphas_cumprod ** 0.5
-            betas2_cumsum = 1-alphas_cumprod
+            alphas_cumsum = 1 - alphas_cumprod ** 0.5
+            betas2_cumsum = 1 - alphas_cumprod
 
             alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
             betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-            alphas = alphas_cumsum-alphas_cumsum_prev
+            alphas = alphas_cumsum - alphas_cumsum_prev
             alphas[0] = 0
-            betas2 = betas2_cumsum-betas2_cumsum_prev
+            betas2 = betas2_cumsum - betas2_cumsum_prev
             betas2[0] = 0
         else:
             alphas = gen_coefficients(timesteps, schedule="decreased")
@@ -681,7 +781,7 @@ class ResidualDiffusion(nn.Module):
             betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
 
         betas_cumsum = torch.sqrt(betas2_cumsum)
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
+        posterior_variance = betas2 * betas2_cumsum_prev / betas2_cumsum
         posterior_variance[0] = 0
 
         timesteps, = alphas.shape
@@ -696,21 +796,22 @@ class ResidualDiffusion(nn.Module):
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
         self.ddim_sampling_eta = ddim_sampling_eta
 
-        def register_buffer(name, val): return self.register_buffer(
-            name, val.to(torch.float32))
+        def register_buffer(name, val):
+            return self.register_buffer(
+                name, val.to(torch.float32))
 
         register_buffer('alphas', alphas)
         register_buffer('alphas_cumsum', alphas_cumsum)
-        register_buffer('one_minus_alphas_cumsum', 1-alphas_cumsum)
+        register_buffer('one_minus_alphas_cumsum', 1 - alphas_cumsum)
         register_buffer('betas2', betas2)
         register_buffer('betas', torch.sqrt(betas2))
         register_buffer('betas2_cumsum', betas2_cumsum)
         register_buffer('betas_cumsum', betas_cumsum)
         register_buffer('posterior_mean_coef1',
-                        betas2_cumsum_prev/betas2_cumsum)
+                        betas2_cumsum_prev / betas2_cumsum)
         register_buffer('posterior_mean_coef2', (betas2 *
-                        alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum)
-        register_buffer('posterior_mean_coef3', betas2/betas2_cumsum)
+                                                 alphas_cumsum_prev - betas2_cumsum_prev * alphas) / betas2_cumsum)
+        register_buffer('posterior_mean_coef3', betas2 / betas2_cumsum)
         register_buffer('posterior_variance', posterior_variance)
         register_buffer('posterior_log_variance_clipped',
                         torch.log(posterior_variance.clamp(min=1e-20)))
@@ -734,8 +835,8 @@ class ResidualDiffusion(nn.Module):
             elif beta_schedule == "scaled_linear":
                 # this schedule is very specific to the latent diffusion model.
                 betas = (
-                    torch.linspace(beta_start**0.5, beta_end**0.5,
-                                   timesteps, dtype=torch.float32) ** 2
+                        torch.linspace(beta_start ** 0.5, beta_end ** 0.5,
+                                       timesteps, dtype=torch.float32) ** 2
                 )
             elif beta_schedule == "squaredcos_cap_v2":
                 # Glide cosine schedule
@@ -746,14 +847,14 @@ class ResidualDiffusion(nn.Module):
 
             alphas = 1.0 - betas
             alphas_cumprod = torch.cumprod(alphas, dim=0)
-            alphas_cumsum = 1-alphas_cumprod ** 0.5
-            betas2_cumsum = 1-alphas_cumprod
+            alphas_cumsum = 1 - alphas_cumprod ** 0.5
+            betas2_cumsum = 1 - alphas_cumprod
 
             alphas_cumsum_prev = F.pad(alphas_cumsum[:-1], (1, 0), value=1.)
             betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-            alphas = alphas_cumsum-alphas_cumsum_prev
+            alphas = alphas_cumsum - alphas_cumsum_prev
             alphas[0] = alphas[1]
-            betas2 = betas2_cumsum-betas2_cumsum_prev
+            betas2 = betas2_cumsum - betas2_cumsum_prev
             betas2[0] = betas2[1]
 
             # adjust
@@ -781,7 +882,7 @@ class ResidualDiffusion(nn.Module):
                 betas2_cumsum[:-1], (1, 0), value=betas2_cumsum[1])
 
         betas_cumsum = torch.sqrt(betas2_cumsum)
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
+        posterior_variance = betas2 * betas2_cumsum_prev / betas2_cumsum
         posterior_variance[0] = 0
 
         timesteps, = alphas.shape
@@ -789,15 +890,15 @@ class ResidualDiffusion(nn.Module):
 
         self.alphas = alphas
         self.alphas_cumsum = alphas_cumsum
-        self.one_minus_alphas_cumsum = 1-alphas_cumsum
+        self.one_minus_alphas_cumsum = 1 - alphas_cumsum
         self.betas2 = betas2
         self.betas = torch.sqrt(betas2)
         self.betas2_cumsum = betas2_cumsum
         self.betas_cumsum = betas_cumsum
-        self.posterior_mean_coef1 = betas2_cumsum_prev/betas2_cumsum
+        self.posterior_mean_coef1 = betas2_cumsum_prev / betas2_cumsum
         self.posterior_mean_coef2 = (
-            betas2 * alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum
-        self.posterior_mean_coef3 = betas2/betas2_cumsum
+                                            betas2 * alphas_cumsum_prev - betas2_cumsum_prev * alphas) / betas2_cumsum
+        self.posterior_mean_coef3 = betas2 / betas2_cumsum
         self.posterior_variance = posterior_variance
         self.posterior_log_variance_clipped = torch.log(
             posterior_variance.clamp(min=1e-20))
@@ -809,31 +910,31 @@ class ResidualDiffusion(nn.Module):
 
     def predict_noise_from_res(self, x_t, t, x_input, pred_res):
         return (
-            (x_t-x_input-(extract(self.alphas_cumsum, t, x_t.shape)-1)
-             * pred_res)/extract(self.betas_cumsum, t, x_t.shape)
+                (x_t - x_input - (extract(self.alphas_cumsum, t, x_t.shape) - 1)
+                 * pred_res) / extract(self.betas_cumsum, t, x_t.shape)
         )
 
     def predict_start_from_xinput_noise(self, x_t, t, x_input, noise):
         return (
-            (x_t-extract(self.alphas_cumsum, t, x_t.shape)*x_input -
-             extract(self.betas_cumsum, t, x_t.shape) * noise)/extract(self.one_minus_alphas_cumsum, t, x_t.shape)
+                (x_t - extract(self.alphas_cumsum, t, x_t.shape) * x_input -
+                 extract(self.betas_cumsum, t, x_t.shape) * noise) / extract(self.one_minus_alphas_cumsum, t, x_t.shape)
         )
 
     def predict_start_from_res_noise(self, x_t, t, x_res, noise):
         return (
-            x_t-extract(self.alphas_cumsum, t, x_t.shape) * x_res -
-            extract(self.betas_cumsum, t, x_t.shape) * noise
+                x_t - extract(self.alphas_cumsum, t, x_t.shape) * x_res -
+                extract(self.betas_cumsum, t, x_t.shape) * noise
         )
 
     def q_posterior_from_res_noise(self, x_res, noise, x_t, t):
-        return (x_t-extract(self.alphas, t, x_t.shape) * x_res -
-                (extract(self.betas2, t, x_t.shape)/extract(self.betas_cumsum, t, x_t.shape)) * noise)
+        return (x_t - extract(self.alphas, t, x_t.shape) * x_res -
+                (extract(self.betas2, t, x_t.shape) / extract(self.betas_cumsum, t, x_t.shape)) * noise)
 
     def q_posterior(self, pred_res, x_start, x_t, t):
         posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_t +
-            extract(self.posterior_mean_coef2, t, x_t.shape) * pred_res +
-            extract(self.posterior_mean_coef3, t, x_t.shape) * x_start
+                extract(self.posterior_mean_coef1, t, x_t.shape) * x_t +
+                extract(self.posterior_mean_coef2, t, x_t.shape) * pred_res +
+                extract(self.posterior_mean_coef3, t, x_t.shape) * x_start
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(
@@ -849,8 +950,8 @@ class ResidualDiffusion(nn.Module):
             else:
                 x_in = torch.cat((x, x_input), dim=1)
         model_output = self.model(x_in,
-                                  [self.alphas_cumsum[t]*self.num_timesteps,
-                                      self.betas_cumsum[t]*self.num_timesteps],
+                                  [self.alphas_cumsum[t] * self.num_timesteps,
+                                   self.betas_cumsum[t] * self.num_timesteps],
                                   x_self_cond)
         maybe_clip = partial(torch.clamp, min=-1.,
                              max=1.) if clip_denoised else identity
@@ -878,7 +979,7 @@ class ResidualDiffusion(nn.Module):
                 pred_res = x_input - x_start
                 pred_res = maybe_clip(pred_res)
         elif self.objective == 'pred_x0_noise':
-            pred_res = x_input-model_output[0]
+            pred_res = x_input - model_output[0]
             pred_noise = model_output[1]
             pred_res = maybe_clip(pred_res)
             x_start = maybe_clip(model_output[0])
@@ -930,8 +1031,8 @@ class ResidualDiffusion(nn.Module):
         batch, device = shape[0], self.betas.device
 
         if self.condition:
-            img = x_input+math.sqrt(self.sum_scale) * \
-                torch.randn(shape, device=device)
+            img = x_input + math.sqrt(self.sum_scale) * \
+                  torch.randn(shape, device=device)
             input_add_noise = img
         else:
             img = torch.randn(shape, device=device)
@@ -951,7 +1052,7 @@ class ResidualDiffusion(nn.Module):
 
         if self.condition:
             if not last:
-                img_list = [input_add_noise]+img_list
+                img_list = [input_add_noise] + img_list
             else:
                 img_list = [input_add_noise, img]
             return unnormalize_to_zero_to_one(img_list)
@@ -981,8 +1082,8 @@ class ResidualDiffusion(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:]))
 
         if self.condition:
-            img = x_input+math.sqrt(self.sum_scale) * \
-                torch.randn(shape, device=device)
+            img = x_input + math.sqrt(self.sum_scale) * \
+                  torch.randn(shape, device=device)
             input_add_noise = img
         else:
             img = torch.randn(shape, device=device)
@@ -1012,17 +1113,17 @@ class ResidualDiffusion(nn.Module):
 
             alpha_cumsum = self.alphas_cumsum[time]
             alpha_cumsum_next = self.alphas_cumsum[time_next]
-            alpha = alpha_cumsum-alpha_cumsum_next
+            alpha = alpha_cumsum - alpha_cumsum_next
 
             betas2_cumsum = self.betas2_cumsum[time]
             betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas2 = betas2_cumsum-betas2_cumsum_next
+            betas2 = betas2_cumsum - betas2_cumsum_next
             betas = betas2.sqrt()
             betas_cumsum = self.betas_cumsum[time]
             betas_cumsum_next = self.betas_cumsum[time_next]
-            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
+            sigma2 = eta * (betas2 * betas2_cumsum_next / betas2_cumsum)
             sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
+                                                                                betas2_cumsum_next - sigma2).sqrt() / betas_cumsum
 
             if eta == 0:
                 noise = 0
@@ -1030,16 +1131,15 @@ class ResidualDiffusion(nn.Module):
                 noise = torch.randn_like(img)
 
             if type == "use_pred_noise":
-                img = img - alpha*pred_res + sigma2.sqrt()*noise
+                img = img - alpha * pred_res + sigma2.sqrt() * noise
             elif type == "use_x_start":
-                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-                    (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-                    (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-                    sigma2.sqrt()*noise
+                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum * img + \
+                      (1 - sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum) * x_start + \
+                      (
+                                  alpha_cumsum_next - alpha_cumsum * sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum) * pred_res + \
+                      sigma2.sqrt() * noise
             if not last:
                 img_list.append(img)
-
-
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full(
@@ -1060,17 +1160,17 @@ class ResidualDiffusion(nn.Module):
 
             alpha_cumsum = self.alphas_cumsum[time]
             alpha_cumsum_next = self.alphas_cumsum[time_next]
-            alpha = alpha_cumsum-alpha_cumsum_next
+            alpha = alpha_cumsum - alpha_cumsum_next
 
             betas2_cumsum = self.betas2_cumsum[time]
             betas2_cumsum_next = self.betas2_cumsum[time_next]
-            betas2 = betas2_cumsum-betas2_cumsum_next
+            betas2 = betas2_cumsum - betas2_cumsum_next
             betas = betas2.sqrt()
             betas_cumsum = self.betas_cumsum[time]
             betas_cumsum_next = self.betas_cumsum[time_next]
-            sigma2 = eta * (betas2*betas2_cumsum_next/betas2_cumsum)
+            sigma2 = eta * (betas2 * betas2_cumsum_next / betas2_cumsum)
             sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum = (
-                betas2_cumsum_next-sigma2).sqrt()/betas_cumsum
+                                                                                betas2_cumsum_next - sigma2).sqrt() / betas_cumsum
 
             if eta == 0:
                 noise = 0
@@ -1078,21 +1178,21 @@ class ResidualDiffusion(nn.Module):
                 noise = torch.randn_like(img)
 
             if type == "use_pred_noise":
-                img = img - (betas_cumsum-(betas2_cumsum_next-sigma2).sqrt()) * \
-                    pred_noise + sigma2.sqrt()*noise
+                img = img - (betas_cumsum - (betas2_cumsum_next - sigma2).sqrt()) * \
+                      pred_noise + sigma2.sqrt() * noise
             elif type == "use_x_start":
-                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum*img + \
-                    (1-sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*x_start + \
-                    (alpha_cumsum_next-alpha_cumsum*sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum)*pred_res + \
-                    sigma2.sqrt()*noise
+                img = sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum * img + \
+                      (1 - sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum) * x_start + \
+                      (
+                                  alpha_cumsum_next - alpha_cumsum * sqrt_betas2_cumsum_next_minus_sigma2_divided_betas_cumsum) * pred_res + \
+                      sigma2.sqrt() * noise
 
             if not last:
                 img_list.append(img)
 
-
         if self.condition:
             if not last:
-                img_list = [input_add_noise]+img_list
+                img_list = [input_add_noise] + img_list
             else:
                 img_list = [input_add_noise, img]
             return unnormalize_to_zero_to_one(img_list)
@@ -1218,8 +1318,8 @@ class ResidualDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         return (
-            x_start+extract(self.alphas_cumsum, t, x_start.shape) * x_res +
-            extract(self.betas_cumsum, t, x_start.shape) * noise
+                x_start + extract(self.alphas_cumsum, t, x_start.shape) * x_res +
+                extract(self.betas_cumsum, t, x_start.shape) * noise
         )
 
     @property
@@ -1271,8 +1371,8 @@ class ResidualDiffusion(nn.Module):
                 x_in = torch.cat((x, x_input), dim=1)
 
         model_out = self.model(x_in,
-                               [self.alphas_cumsum[t]*self.num_timesteps,
-                                   self.betas_cumsum[t]*self.num_timesteps],
+                               [self.alphas_cumsum[t] * self.num_timesteps,
+                                self.betas_cumsum[t] * self.num_timesteps],
                                x_self_cond)
 
         target = []
@@ -1286,7 +1386,7 @@ class ResidualDiffusion(nn.Module):
             target.append(x_start)
             target.append(noise)
 
-            pred_res = x_input-model_out[0]
+            pred_res = x_input - model_out[0]
             pred_noise = model_out[1]
         elif self.objective == "pred_noise":
             target.append(noise)
@@ -1305,7 +1405,7 @@ class ResidualDiffusion(nn.Module):
         if u_loss:
             x_u = self.q_posterior_from_res_noise(pred_res, pred_noise, x, t)
             u_gt = self.q_posterior_from_res_noise(x_res, noise, x, t)
-            loss = 10000*self.loss_fn(x_u, u_gt, reduction='none')
+            loss = 10000 * self.loss_fn(x_u, u_gt, reduction='none')
             return [loss]
         else:
             loss_list = []
@@ -1332,36 +1432,37 @@ class ResidualDiffusion(nn.Module):
 
         return self.p_losses(img, t, *args, **kwargs)
 
+
 # trainer class
 
 
 class Trainer(object):
     def __init__(
-        self,
-        diffusion_model,
-        folder,
-        *,
-        train_batch_size=16,
-        gradient_accumulate_every=1,
-        augment_flip=True,
-        train_lr=1e-4,
-        train_num_steps=100000,
-        ema_update_every=10,
-        ema_decay=0.995,
-        adam_betas=(0.9, 0.99),
-        save_and_sample_every=1000,
-        num_samples=25,
-        results_folder='./results/sample',
-        amp=False,
-        fp16=False,
-        split_batches=True,
-        convert_image_to=None,
-        condition=False,
-        sub_dir=False,
-        equalizeHist=False,
-        crop_patch=False,
-        generation=False,
-        num_unet=2
+            self,
+            diffusion_model,
+            folder,
+            *,
+            train_batch_size=16,
+            gradient_accumulate_every=1,
+            augment_flip=True,
+            train_lr=1e-4,
+            train_num_steps=100000,
+            ema_update_every=10,
+            ema_decay=0.995,
+            adam_betas=(0.9, 0.99),
+            save_and_sample_every=1000,
+            num_samples=25,
+            results_folder='./results/sample',
+            amp=False,
+            fp16=False,
+            split_batches=True,
+            convert_image_to=None,
+            condition=False,
+            sub_dir=False,
+            equalizeHist=False,
+            crop_patch=False,
+            generation=False,
+            num_unet=2
     ):
         super().__init__()
 
@@ -1394,55 +1495,65 @@ class Trainer(object):
                 self.condition_type = 1
                 # test_input
                 ds = dataset(folder[-1], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                             augment_flip=False, convert_image_to=convert_image_to, condition=0,
+                             equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
+                self.sample_loader = cycle(
+                    self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
+                                                        pin_memory=True, num_workers=4)))  # cpu_count()
 
                 ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
+                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist,
+                             crop_patch=crop_patch, generation=generation)
                 self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
+                                                                    shuffle=True, pin_memory=True, num_workers=4)))
             elif len(folder) == 4:
                 self.condition_type = 2
                 # test_gt+test_input
                 ds = dataset(folder[2:4], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                             augment_flip=False, convert_image_to=convert_image_to, condition=1,
+                             equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
+                self.sample_loader = cycle(
+                    self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
+                                                        pin_memory=True, num_workers=4)))  # cpu_count()
 
                 ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
+                             convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist,
+                             crop_patch=crop_patch, generation=generation)
                 self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
+                                                                    shuffle=True, pin_memory=True, num_workers=4)))
             elif len(folder) == 6:
                 self.condition_type = 3
                 # test_gt+test_input
                 ds = dataset(folder[3:6], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=2, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                             augment_flip=False, convert_image_to=convert_image_to, condition=2,
+                             equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
                 trian_folder = folder[0:3]
 
                 self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
-                                                                               pin_memory=True, num_workers=4)))  # cpu_count()
+                self.sample_loader = cycle(
+                    self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
+                                                        pin_memory=True, num_workers=4)))  # cpu_count()
 
                 ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                             convert_image_to=convert_image_to, condition=2, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
+                             convert_image_to=convert_image_to, condition=2, equalizeHist=equalizeHist,
+                             crop_patch=crop_patch, generation=generation)
                 self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                                shuffle=True, pin_memory=True, num_workers=4)))
+                                                                    shuffle=True, pin_memory=True, num_workers=4)))
         else:
             self.condition_type = 0
             trian_folder = folder
 
             ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
-                         convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist, crop_patch=crop_patch, generation=generation)
+                         convert_image_to=convert_image_to, condition=0, equalizeHist=equalizeHist,
+                         crop_patch=crop_patch, generation=generation)
             self.dl = cycle(self.accelerator.prepare(DataLoader(ds, batch_size=train_batch_size,
-                            shuffle=True, pin_memory=True, num_workers=4)))
+                                                                shuffle=True, pin_memory=True, num_workers=4)))
 
         # optimizer
 
@@ -1522,81 +1633,81 @@ class Trainer(object):
             if exists(self.accelerator.scaler) and exists(data['scaler']):
                 self.accelerator.scaler.load_state_dict(data['scaler'])
 
-            print("load model - "+str(path))
+            print("load model - " + str(path))
 
         # self.ema.to(self.device)
 
     def train(self):
         accelerator = self.accelerator
+        device = accelerator.device
 
         with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
-
             while self.step < self.train_num_steps:
-
                 if self.num_unet == 1:
                     total_loss = [0]
                 elif self.num_unet == 2:
                     total_loss = [0, 0]
+
                 for _ in range(self.gradient_accumulate_every):
-                    if self.condition:
-                        data = next(self.dl)
-                        data = [item.to(self.device) for item in data]
+                    data = next(self.dl)
+                    if isinstance(data, (tuple, list)):
+                        images, labels = data
+                        images = images.to(device)
+                        labels = labels.to(device)
                     else:
-                        data = next(self.dl)
-                        data = data[0] if isinstance(data, list) else data
-                        data = data.to(self.device)
+                        images = data.to(device)
+                        labels = None
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
-                        for i in range(self.num_unet):
-                            loss[i] = loss[i] / self.gradient_accumulate_every
-                            total_loss[i] = total_loss[i] + loss[i].item()
+                        if labels is not None and hasattr(self.model, 'compute_adv_loss'):
+                            # 对抗训练步骤
+                            losses = self.model(images, labels)
+                        else:
+                            # 常规训练步骤
+                            losses = self.model(images)
 
-                    for i in range(self.num_unet):
-                        self.accelerator.backward(loss[i])
+                        # 确保losses是列表
+                        if not isinstance(losses, list):
+                            losses = [losses]
 
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                        # 处理每个loss
+                        for i, loss in enumerate(losses):
+                            loss = loss / self.gradient_accumulate_every
+                            # 使用retain_graph确保多个损失可以正确反向传播
+                            retain_graph = (i < len(losses) - 1)  # 除了最后一个loss，其他都需要retain_graph
+                            self.accelerator.backward(loss, retain_graph=retain_graph)
+                            total_loss[i] = total_loss[i] + loss.item()
 
-                accelerator.wait_for_everyone()
+                    accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                    accelerator.wait_for_everyone()
 
-                if self.num_unet == 1:
-                    self.opt0.step()
-                    self.opt0.zero_grad()
-                elif self.num_unet == 2:
-                    self.opt0.step()
-                    self.opt0.zero_grad()
-                    self.opt1.step()
-                    self.opt1.zero_grad()
+                    if self.num_unet == 1:
+                        self.opt0.step()
+                        self.opt0.zero_grad()
+                    elif self.num_unet == 2:
+                        self.opt0.step()
+                        self.opt0.zero_grad()
+                        self.opt1.step()
+                        self.opt1.zero_grad()
 
-                accelerator.wait_for_everyone()
+                    accelerator.wait_for_everyone()
 
-                self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.to(self.device)
-                    self.ema.update()
+                    self.step += 1
+                    if accelerator.is_main_process:
+                        self.ema.to(device)
+                        self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                        milestone = self.step // self.save_and_sample_every
-                        self.sample(milestone)
-
-                        if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
+                        if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                            milestone = self.step // self.save_and_sample_every
                             self.save(milestone)
-                            results_folder = self.results_folder
-                            gen_img = './results/test_timestep_10_' + \
-                                str(milestone)+"_pt"
-                            self.set_results_folder(gen_img)
-                            self.test(last=True, FID=True)
-                            fid_and_inception_score_path = os.path.join(os.getcwd(), "eval", "image_generation_eval", "image_generation_eval")
-                            os.system("python "+fid_and_inception_score_path+" "+gen_img)
-                            self.set_results_folder(results_folder)
-                if self.num_unet == 1:
-                    pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
-                elif self.num_unet == 2:
-                    pbar.set_description(
-                        f'loss_unet0: {total_loss[0]:.4f},loss_unet1: {total_loss[1]:.4f}')
-                pbar.update(1)
 
-        accelerator.print('training complete')
+                    if self.num_unet == 1:
+                        pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
+                    elif self.num_unet == 2:
+                        pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}, loss_unet1: {total_loss[1]:.4f}')
+                    pbar.update(1)
+
+            accelerator.print('training complete')
 
     def sample(self, milestone, last=True, FID=False):
         self.ema.ema_model.eval()
@@ -1623,8 +1734,8 @@ class Trainer(object):
                 x_input_sample = x_input_sample[1:]
 
             all_images_list = show_x_input_sample + \
-                list(self.ema.ema_model.sample(
-                    x_input_sample, batch_size=batches, last=last))
+                              list(self.ema.ema_model.sample(
+                                  x_input_sample, batch_size=batches, last=last))
 
             all_images = torch.cat(all_images_list, dim=0)
 
@@ -1645,7 +1756,7 @@ class Trainer(object):
                 file_name = f'sample-{milestone}.png'
                 utils.save_image(all_images, str(
                     self.results_folder / file_name), nrow=nrow)
-            print("sampe-save "+file_name)
+            print("sampe-save " + file_name)
         return milestone
 
     def test(self, sample=False, last=True, FID=False):
@@ -1688,8 +1799,8 @@ class Trainer(object):
 
                     if sample:
                         all_images_list = show_x_input_sample + \
-                            list(self.ema.ema_model.sample(
-                                x_input_sample, batch_size=batches))
+                                          list(self.ema.ema_model.sample(
+                                              x_input_sample, batch_size=batches))
                     else:
                         all_images_list = list(self.ema.ema_model.sample(
                             x_input_sample, batch_size=batches, last=last))
@@ -1700,7 +1811,7 @@ class Trainer(object):
                                 pad_size = self.sample_dataset.get_pad_size(i)
                                 _, _, h, w = img.shape
                                 img = img[:, :, 0:h -
-                                          pad_size[0], 0:w-pad_size[1]]
+                                                  pad_size[0], 0:w - pad_size[1]]
                                 all_images_list[k] = img
                                 k += 1
 
@@ -1713,13 +1824,13 @@ class Trainer(object):
 
                 utils.save_image(all_images, str(
                     self.results_folder / file_name), nrow=nrow)
-                print("test-save "+file_name)
+                print("test-save " + file_name)
         else:
             if FID:
                 self.total_n_samples = 50000
                 img_id = len(glob.glob(f"{self.results_folder}/*"))
                 n_rounds = (self.total_n_samples -
-                            img_id) // self.num_samples+1
+                            img_id) // self.num_samples + 1
             else:
                 n_rounds = 100
             for i in range(n_rounds):
